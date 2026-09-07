@@ -355,13 +355,24 @@ int main(int argc, char *argv[]){
             torch::Tensor rgb = model.forward(*valCam, numIters);
             torch::Tensor gt = valCam->getImageGpu(model.getDownscaleFactor(numIters), device);
             torch::Tensor valMask = valCam->getMaskGpu(model.getDownscaleFactor(numIters), device);
-            std::cout << valCam->filePath << " validation loss: " << model.mainLoss(rgb, gt, valMask, ssimWeight).item<float>() << std::endl;
+
+            // The ground truth is a hazy photograph, so the medium has to be put back in
+            // before scoring. Comparing the restored render against it would punish the
+            // model for the very thing it is supposed to do.
+            torch::Tensor rendered = rgb;
+            if (medium && numIters > mediumFromIter){
+                torch::NoGradGuard noGrad;
+                rendered = medium->compose(rgb.detach(), mediumDepth(*valCam, numIters));
+                std::cout << "Validating through the medium (metrics are against the observed image)" << std::endl;
+            }
+
+            std::cout << valCam->filePath << " validation loss: " << model.mainLoss(rendered, gt, valMask, ssimWeight).item<float>() << std::endl;
 
             torch::Tensor mse;
             if (valMask.defined() && valMask.numel() > 0){
-                mse = (valMask.unsqueeze(-1) * (rgb - gt).pow(2)).sum() / (valMask.sum() * gt.size(2) + 1e-8f);
+                mse = (valMask.unsqueeze(-1) * (rendered - gt).pow(2)).sum() / (valMask.sum() * gt.size(2) + 1e-8f);
             }else{
-                mse = (rgb - gt).pow(2).mean();
+                mse = (rendered - gt).pow(2).mean();
             }
             std::cout << valCam->filePath << " validation PSNR: " << (10.0f * torch::log10(1.0f / mse)).item<float>() << std::endl;
         }
