@@ -238,7 +238,7 @@ torch::Tensor Model::forward(Camera& cam, int step){
         #endif
     }
 
-    rgb = torch::clamp_max(rgb, 1.0f);
+    if (clampRgb) rgb = torch::clamp_max(rgb, 1.0f);
 
     return rgb;
 }

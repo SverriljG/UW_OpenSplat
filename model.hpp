@@ -126,6 +126,11 @@ struct Model{
   int lastHeight; // set in forward()
   int lastWidth; // set in forward()
 
+  // Vanilla 3DGS only clamps rendered color from below. The upper clamp has to be
+  // released when rendering through a medium: inverting I = J*A + B needs J > 1 wherever
+  // attenuation is strong, which is precisely the red channel we want to recover.
+  bool clampRgb = true;
+
   bool scoringPass = false; // true while computeMultiViewScores drives forward/backward
   torch::Tensor xyzGradAccum; // [N] accumulated ||d mean2d||
   torch::Tensor xyzGradAbsAccum; // [N] accumulated ||d mean2d|| (absolute, Abs-GS)

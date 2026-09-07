@@ -226,6 +226,7 @@ int main(int argc, char *argv[]){
         if (underwater){
             if (device == torch::kCPU) throw std::runtime_error("--underwater requires a GPU backend (MPS/CUDA)");
             medium.reset(new MediumModel(device, mediumLr, mediumResidual));
+            model.clampRgb = false;
             std::cout << "Underwater image formation model enabled from step " << mediumFromIter << std::endl;
         }
 
@@ -300,7 +301,7 @@ int main(int argc, char *argv[]){
 
             if (!valRender.empty() && step % 10 == 0){
                 torch::Tensor rgb = model.forward(*valCam, step);
-                cv::Mat image = tensorToImage(rgb.detach().cpu());
+                cv::Mat image = tensorToImage(rgb.detach().clamp(0.0f, 1.0f).cpu());
                 cv::cvtColor(image, image, cv::COLOR_RGB2BGR);
                 cv::imwrite((fs::path(valRender) / (std::to_string(step) + ".png")).string(), image);
 
