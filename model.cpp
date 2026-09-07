@@ -243,6 +243,90 @@ torch::Tensor Model::forward(Camera& cam, int step){
     return rgb;
 }
 
+torch::Tensor Model::renderDepth(Camera& cam, int step){
+#if defined(USE_HIP) || defined(USE_CUDA) || defined(USE_MPS)
+    if (device == torch::kCPU) throw std::runtime_error("Depth rendering requires a GPU backend");
+
+    const float scaleFactor = getDownscaleFactor(step);
+    const float fx = cam.fx / scaleFactor;
+    const float fy = cam.fy / scaleFactor;
+    const float cx = cam.cx / scaleFactor;
+    const float cy = cam.cy / scaleFactor;
+    const int height = static_cast<int>(static_cast<float>(cam.height) / scaleFactor);
+    const int width = static_cast<int>(static_cast<float>(cam.width) / scaleFactor);
+
+    torch::Tensor R = cam.camToWorld.index({Slice(None, 3), Slice(None, 3)});
+    torch::Tensor T = cam.camToWorld.index({Slice(None, 3), Slice(3,4)});
+    R = torch::matmul(R, torch::diag(torch::tensor({1.0f, -1.0f, -1.0f}, R.device())));
+
+    torch::Tensor Rinv = R.transpose(0, 1);
+    torch::Tensor Tinv = torch::matmul(-Rinv, T);
+
+    torch::Tensor viewMat = torch::eye(4, device);
+    viewMat.index_put_({Slice(None, 3), Slice(None, 3)}, Rinv);
+    viewMat.index_put_({Slice(None, 3), Slice(3, 4)}, Tinv);
+
+    float fovX = 2.0f * std::atan(width / (2.0f * fx));
+    float fovY = 2.0f * std::atan(height / (2.0f * fy));
+    torch::Tensor projMat = projectionMatrix(0.001f, 1000.0f, fovX, fovY, device);
+
+    TileBounds tileBounds = std::make_tuple((width + BLOCK_X - 1) / BLOCK_X,
+                    (height + BLOCK_Y - 1) / BLOCK_Y,
+                    1);
+
+    auto p = ProjectGaussians::apply(means,
+                    torch::exp(scales),
+                    1,
+                    quats / quats.norm(2, {-1}, true),
+                    viewMat,
+                    torch::matmul(projMat, viewMat),
+                    fx,
+                    fy,
+                    cx,
+                    cy,
+                    height,
+                    width,
+                    tileBounds);
+
+    torch::Tensor depthXys = p[0];
+    torch::Tensor depthZ = p[1];
+    torch::Tensor depthRadii = p[2];
+    torch::Tensor depthConics = p[3];
+    torch::Tensor depthNumTilesHit = p[4];
+
+    auto fOpts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
+    if (depthRadii.sum().item<float>() == 0.0f) return torch::zeros({height, width}, fOpts);
+
+    #ifdef USE_MPS
+    torch::mps::synchronize();
+    #endif
+
+    // Camera-space z as a 3-channel color keeps the fast rasterizer path
+    torch::Tensor depthColors = depthZ.reshape({-1, 1}).repeat({1, 3});
+
+    auto rast = RasterizeGaussians::apply(
+            depthXys,
+            depthZ,
+            depthRadii,
+            depthConics,
+            depthNumTilesHit,
+            depthColors,
+            torch::sigmoid(opacities),
+            height,
+            width,
+            torch::zeros({3}, fOpts));
+
+    torch::Tensor depth = rast[0].select(-1, 0);
+    torch::Tensor alpha = rast[1];
+
+    // Alpha-normalize so partially covered pixels report metric depth rather than
+    // an opacity-weighted sum. Empty pixels stay at 0 because depth is 0 there too.
+    return depth / torch::clamp_min(alpha, 1e-6f);
+#else
+    throw std::runtime_error("GPU support not built, cannot render depth");
+#endif
+}
+
 static void setOptimizerLr(torch::optim::Adam *opt, double lr){
     static_cast<torch::optim::AdamOptions&>(opt->param_groups()[0].options()).set_lr(lr);
 }

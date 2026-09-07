@@ -75,6 +75,11 @@ struct Model{
   void releaseOptimizers();
 
   torch::Tensor forward(Camera& cam, int step);
+
+  // Rasterizes per-gaussian camera-space z as color to obtain an alpha-normalized
+  // [H,W] depth map. Requires a GPU backend (MPS/CUDA/HIP).
+  torch::Tensor renderDepth(Camera& cam, int step);
+
   void optimizerStepCadence(int step); // FastGS stepping schedule with gradient accumulation
   void schedulersStep(int step);
   int getDownscaleFactor(int step);

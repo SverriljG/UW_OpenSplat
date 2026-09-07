@@ -263,6 +263,7 @@ add_library(gsplat_cpu rasterizer/gsplat-cpu/gsplat_cpu.cpp)
 target_include_directories(gsplat_cpu PRIVATE ${TORCH_INCLUDE_DIRS})
 
 set(OPENSPLAT_SRC_FILES opensplat.cpp point_io.cpp nerfstudio.cpp model.cpp
+medium.cpp
 kdtree_tensor.cpp spherical_harmonics.cpp cv_utils.cpp project_gaussians.cpp
 rasterize_gaussians.cpp ssim.cpp colmap.cpp opensfm.cpp openmvg.cpp input_data.cpp
 tensor_math.cpp rad.cpp zip_utils.cpp undistort.cpp)

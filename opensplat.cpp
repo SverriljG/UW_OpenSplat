@@ -2,6 +2,7 @@
 #include <nlohmann/json.hpp>
 #include "opensplat.hpp"
 #include "input_data.hpp"
+#include "medium.hpp"
 #include "utils.hpp"
 #include "cv_utils.hpp"
 #include "constants.hpp"
@@ -26,6 +27,16 @@ int main(int argc, char *argv[]){
         ("val", "Withhold a camera shot for validating the scene loss")
         ("val-image", "Filename of the image to withhold for validating scene loss", cxxopts::value<std::string>()->default_value("random"))
         ("val-render", "Path of the directory where to render validation images", cxxopts::value<std::string>()->default_value(""))
+        ("depth-render", "Path of the directory where to write rendered depth maps for every camera", cxxopts::value<std::string>()->default_value(""))
+        ("depth-only", "Only render depth maps (requires --resume and --depth-render), then exit without training", cxxopts::value<bool>()->default_value("false"))
+
+        ("underwater", "Train through an underwater image formation model (attenuation + backscatter). Gaussians keep medium-free color while the loss is scored against the hazy photograph", cxxopts::value<bool>()->default_value("false"))
+        ("medium-from-iter", "Enable the underwater model after these many steps, giving geometry time to settle first (-1 = half of num-iters)", cxxopts::value<int>()->default_value("-1"))
+        ("medium-lr", "Learning rate for the underwater medium parameters", cxxopts::value<float>()->default_value("0.01"))
+        ("medium-residual", "Include the SeaThru residual backscatter term", cxxopts::value<bool>()->default_value("false"))
+        ("medium-normalize-depth", "Min-max normalize depth per image before the medium model (reproduces SeaSplat, but discards metric range)", cxxopts::value<bool>()->default_value("false"))
+        ("medium-detach-depth", "Do not backpropagate the medium loss into gaussian positions through depth (cheaper, and an ablation of the geometry claim)", cxxopts::value<bool>()->default_value("false"))
+        ("medium-grayworld", "Weight of a gray-world prior on the recovered color, which discourages the medium from explaining the whole image", cxxopts::value<float>()->default_value("0.0"))
         ("center", "Center the model at the origin")
         ("cpu", "Force CPU execution")
         
@@ -87,6 +98,25 @@ int main(int argc, char *argv[]){
     const std::string valImage = result["val-image"].as<std::string>();
     const std::string valRender = result["val-render"].as<std::string>();
     if (!valRender.empty() && !fs::exists(valRender)) fs::create_directories(valRender);
+    const std::string depthRender = result["depth-render"].as<std::string>();
+    const bool depthOnly = result["depth-only"].as<bool>();
+    if (!depthRender.empty() && !fs::exists(depthRender)) fs::create_directories(depthRender);
+    if (depthOnly && depthRender.empty()){
+        std::cerr << "--depth-only requires --depth-render <directory>" << std::endl;
+        return EXIT_FAILURE;
+    }
+    if (depthOnly && result["resume"].as<std::string>().empty()){
+        std::cerr << "--depth-only requires --resume <ply>" << std::endl;
+        return EXIT_FAILURE;
+    }
+    const bool underwater = result["underwater"].as<bool>();
+    int mediumFromIter = result["medium-from-iter"].as<int>();
+    if (mediumFromIter < 0) mediumFromIter = result["num-iters"].as<int>() / 2;
+    const float mediumLr = result["medium-lr"].as<float>();
+    const bool mediumResidual = result["medium-residual"].as<bool>();
+    const bool mediumNormalizeDepth = result["medium-normalize-depth"].as<bool>();
+    const bool mediumDetachDepth = result["medium-detach-depth"].as<bool>();
+    const float mediumGrayWorld = result["medium-grayworld"].as<float>();
     const bool keepCrs = result.count("center") == 0;
     const float downScaleFactor = (std::max)(result["downscale-factor"].as<float>(), 1.0f);
     const int numIters = result["num-iters"].as<int>();
@@ -171,6 +201,57 @@ int main(int argc, char *argv[]){
             step = model.loadPly(resume) + 1;
         }
 
+        auto writeDepthMap = [&model, &device](Camera &c, int atStep, const std::string &dir){
+            torch::NoGradGuard noGrad;
+            torch::Tensor depth = model.renderDepth(c, atStep).detach().cpu().contiguous();
+            const float dMin = depth.min().item<float>();
+            const float dMax = depth.max().item<float>();
+            torch::Tensor norm = (dMax - dMin) > 1e-8f ? (depth - dMin) / (dMax - dMin)
+                                                       : torch::zeros_like(depth);
+            torch::Tensor scaled = (norm * 255.0f).toType(torch::kU8).contiguous();
+
+            cv::Mat gray(static_cast<int>(depth.size(0)), static_cast<int>(depth.size(1)), CV_8UC1);
+            std::copy(scaled.data_ptr<uint8_t>(), scaled.data_ptr<uint8_t>() + scaled.numel(), gray.data);
+            cv::Mat colored;
+            cv::applyColorMap(gray, colored, cv::COLORMAP_JET);
+
+            const std::string stem = fs::path(c.filePath).stem().string();
+            cv::imwrite((fs::path(dir) / (stem + "_depth.png")).string(), colored);
+            std::cout << stem << " depth range: " << dMin << " to " << dMax << std::endl;
+        };
+
+        std::unique_ptr<MediumModel> medium;
+        if (underwater){
+            if (device == torch::kCPU) throw std::runtime_error("--underwater requires a GPU backend (MPS/CUDA)");
+            medium.reset(new MediumModel(device, mediumLr, mediumResidual));
+            std::cout << "Underwater image formation model enabled from step " << mediumFromIter << std::endl;
+        }
+
+        // Renders the depth map the medium model consumes
+        auto mediumDepth = [&model, mediumDetachDepth, mediumNormalizeDepth](Camera &c, int atStep){
+            torch::Tensor depth;
+            if (mediumDetachDepth){
+                torch::NoGradGuard noGrad;
+                depth = model.renderDepth(c, atStep).detach();
+            }else{
+                depth = model.renderDepth(c, atStep);
+            }
+            if (mediumNormalizeDepth){
+                torch::Tensor dMin = depth.min().detach();
+                torch::Tensor dMax = depth.max().detach();
+                depth = (depth - dMin) / torch::clamp_min(dMax - dMin, 1e-6f);
+            }
+            return depth;
+        };
+
+        if (depthOnly){
+            if (device == torch::kCPU) throw std::runtime_error("--depth-only requires a GPU backend (MPS/CUDA)");
+            for (Camera &c : cams) writeDepthMap(c, numIters, depthRender);
+            if (valCam != nullptr) writeDepthMap(*valCam, numIters, depthRender);
+            std::cout << "Wrote depth maps to " << depthRender << std::endl;
+            return EXIT_SUCCESS;
+        }
+
         for (; step <= numIters; step++){
             Camera& cam = cams[ camsIter.next() ];
 
@@ -178,8 +259,19 @@ int main(int argc, char *argv[]){
             torch::Tensor gt = cam.getImageGpu(model.getDownscaleFactor(step), device);
             torch::Tensor mask = cam.getMaskGpu(model.getDownscaleFactor(step), device);
 
-            torch::Tensor mainLoss = model.mainLoss(rgb, gt, mask, ssimWeight);
+            // With the medium enabled the gaussians render medium-free color, which is
+            // pushed through attenuation and backscatter before being compared to the photo
+            const bool mediumActive = medium && static_cast<int>(step) > mediumFromIter;
+            torch::Tensor rendered = mediumActive ? medium->compose(rgb, mediumDepth(cam, step))
+                                                  : rgb;
+
+            torch::Tensor mainLoss = model.mainLoss(rendered, gt, mask, ssimWeight);
+            if (mediumActive && mediumGrayWorld > 0.0f){
+                torch::Tensor channelMean = rgb.mean(std::vector<int64_t>{0, 1});
+                mainLoss = mainLoss + mediumGrayWorld * (channelMean - channelMean.mean()).pow(2).sum();
+            }
             mainLoss.backward();
+            if (mediumActive) medium->step();
 
             if (step % displayStep == 0) {
                 const float percentage = static_cast<float>(step) / numIters;
@@ -200,6 +292,15 @@ int main(int argc, char *argv[]){
                 cv::Mat image = tensorToImage(rgb.detach().cpu());
                 cv::cvtColor(image, image, cv::COLOR_RGB2BGR);
                 cv::imwrite((fs::path(valRender) / (std::to_string(step) + ".png")).string(), image);
+
+                // Alongside the restored render, write what the medium turns it into
+                if (mediumActive){
+                    torch::NoGradGuard noGrad;
+                    torch::Tensor uw = medium->compose(rgb.detach(), mediumDepth(*valCam, step));
+                    cv::Mat uwImage = tensorToImage(uw.detach().cpu());
+                    cv::cvtColor(uwImage, uwImage, cv::COLOR_RGB2BGR);
+                    cv::imwrite((fs::path(valRender) / (std::to_string(step) + "_uw.png")).string(), uwImage);
+                }
             }
 
 #ifdef USE_VISUALIZATION
@@ -219,6 +320,35 @@ int main(int argc, char *argv[]){
         if (!outputCameras.empty()) inputData.saveCameras(outputCameras, keepCrs);
         model.save(outputScene, numIters);
         // model.saveDebugPly("debug.ply", numIters);
+
+        if (!depthRender.empty() && device != torch::kCPU){
+            for (Camera &c : cams) writeDepthMap(c, numIters, depthRender);
+            if (valCam != nullptr) writeDepthMap(*valCam, numIters, depthRender);
+        }
+
+        if (medium){
+            std::cout << medium->summary() << std::endl;
+
+            auto toVec = [](const torch::Tensor &t){
+                torch::Tensor c = t.detach().to(torch::kCPU).reshape({3}).contiguous();
+                return std::vector<float>(c.data_ptr<float>(), c.data_ptr<float>() + 3);
+            };
+            nlohmann::json j;
+            j["attenuation_a"] = toVec(medium->effectiveAttenCoef());
+            j["attenuation_b"] = toVec(medium->effectiveAttenDecay());
+            j["backscatter_beta"] = toVec(medium->effectiveBsCoef());
+            j["backscatter_b_inf"] = toVec(medium->effectiveBInf());
+            j["medium_from_iter"] = mediumFromIter;
+            j["normalized_depth"] = mediumNormalizeDepth;
+            j["detached_depth"] = mediumDetachDepth;
+
+            fs::path mediumPath(outputScene);
+            mediumPath.replace_extension(".medium.json");
+            std::ofstream mediumOut(mediumPath.string());
+            mediumOut << j.dump(4);
+            mediumOut.close();
+            std::cout << "Wrote " << mediumPath.string() << std::endl;
+        }
 
         // Validate
         if (valCam != nullptr){
