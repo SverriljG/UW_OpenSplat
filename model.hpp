@@ -119,6 +119,7 @@ struct Model{
   torch::Tensor radii; // set in forward()
   torch::Tensor xys; // set in forward()
   torch::Tensor lastAlpha; // set in forward()
+  torch::Tensor lastDepthAlpha; // set in renderDepth(), identifies pixels no gaussian covers
   torch::Tensor errorMap; // [H,W] binary metric map for scoring passes, read by rasterize backward
   torch::Tensor densificationInfo; // [4,N] accumulated by rasterize backward
   torch::Tensor xyAbsGrad; // [N,2] Abs-GS screen-gradient accumulation, filled by rasterize backward

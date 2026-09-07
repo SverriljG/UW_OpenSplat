@@ -37,6 +37,7 @@ int main(int argc, char *argv[]){
         ("medium-normalize-depth", "Min-max normalize depth per image before the medium model (reproduces SeaSplat, but discards metric range)", cxxopts::value<bool>()->default_value("false"))
         ("medium-detach-depth", "Do not backpropagate the medium loss into gaussian positions through depth (cheaper, and an ablation of the geometry claim)", cxxopts::value<bool>()->default_value("false"))
         ("medium-grayworld", "Weight of a gray-world prior on the recovered color, which discourages the medium from explaining the whole image", cxxopts::value<float>()->default_value("0.0"))
+        ("no-medium-bg-depth", "Do not push uncovered pixels to the far plane before the medium model. Those pixels are open water rather than zero distance, so by default backscatter is allowed to fill them", cxxopts::value<bool>()->default_value("false"))
         ("center", "Center the model at the origin")
         ("cpu", "Force CPU execution")
         
@@ -117,6 +118,7 @@ int main(int argc, char *argv[]){
     const bool mediumNormalizeDepth = result["medium-normalize-depth"].as<bool>();
     const bool mediumDetachDepth = result["medium-detach-depth"].as<bool>();
     const float mediumGrayWorld = result["medium-grayworld"].as<float>();
+    const bool mediumBgDepth = !result["no-medium-bg-depth"].as<bool>();
     const bool keepCrs = result.count("center") == 0;
     const float downScaleFactor = (std::max)(result["downscale-factor"].as<float>(), 1.0f);
     const int numIters = result["num-iters"].as<int>();
@@ -228,7 +230,7 @@ int main(int argc, char *argv[]){
         }
 
         // Renders the depth map the medium model consumes
-        auto mediumDepth = [&model, mediumDetachDepth, mediumNormalizeDepth](Camera &c, int atStep){
+        auto mediumDepth = [&model, mediumDetachDepth, mediumNormalizeDepth, mediumBgDepth](Camera &c, int atStep){
             torch::Tensor depth;
             if (mediumDetachDepth){
                 torch::NoGradGuard noGrad;
@@ -236,6 +238,15 @@ int main(int argc, char *argv[]){
             }else{
                 depth = model.renderDepth(c, atStep);
             }
+
+            // A pixel no gaussian covers is open water, not zero distance. Pushing it to
+            // the far plane lets backscatter saturate to B_inf and supply the water column
+            // color, instead of the medium predicting black where the photo is bright.
+            if (mediumBgDepth && model.lastDepthAlpha.defined() &&
+                model.lastDepthAlpha.numel() == depth.numel()){
+                depth = depth + (1.0f - model.lastDepthAlpha) * depth.max().detach();
+            }
+
             if (mediumNormalizeDepth){
                 torch::Tensor dMin = depth.min().detach();
                 torch::Tensor dMax = depth.max().detach();

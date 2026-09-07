@@ -295,7 +295,10 @@ torch::Tensor Model::renderDepth(Camera& cam, int step){
     torch::Tensor depthNumTilesHit = p[4];
 
     auto fOpts = torch::TensorOptions().dtype(torch::kFloat32).device(device);
-    if (depthRadii.sum().item<float>() == 0.0f) return torch::zeros({height, width}, fOpts);
+    if (depthRadii.sum().item<float>() == 0.0f){
+        lastDepthAlpha = torch::zeros({height, width}, fOpts);
+        return torch::zeros({height, width}, fOpts);
+    }
 
     #ifdef USE_MPS
     torch::mps::synchronize();
@@ -318,6 +321,7 @@ torch::Tensor Model::renderDepth(Camera& cam, int step){
 
     torch::Tensor depth = rast[0].select(-1, 0);
     torch::Tensor alpha = rast[1];
+    lastDepthAlpha = alpha.detach();
 
     // Alpha-normalize so partially covered pixels report metric depth rather than
     // an opacity-weighted sum. Empty pixels stay at 0 because depth is 0 there too.
