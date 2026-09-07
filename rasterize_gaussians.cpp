@@ -122,6 +122,8 @@ tensor_list RasterizeGaussians::backward(AutogradContext *ctx, tensor_list grad_
 
     if (!v_outAlpha.defined()) v_outAlpha = torch::zeros_like(finalTs);
     v_outAlpha = v_outAlpha.contiguous();
+    // The gradient can arrive expanded rather than materialized, e.g. from rgb.sum()
+    v_outImg = v_outImg.contiguous();
     if (!errorMap.defined()) errorMap = torch::empty({0}, xys.options());
     if (!edgeMap.defined()) edgeMap = torch::empty({0}, xys.options());
     if (!densificationInfo.defined()) densificationInfo = torch::empty({0}, xys.options());
@@ -240,6 +242,7 @@ tensor_list RasterizeGaussiansCPU::backward(AutogradContext *ctx, tensor_list gr
 
     if (!v_outAlpha.defined()) v_outAlpha = torch::zeros_like(finalTs);
     v_outAlpha = v_outAlpha.contiguous();
+    v_outImg = v_outImg.contiguous();
     if (!errorMap.defined()) errorMap = torch::empty({0}, xys.options());
     if (!edgeMap.defined()) edgeMap = torch::empty({0}, xys.options());
     if (!densificationInfo.defined()) densificationInfo = torch::empty({0}, xys.options());
