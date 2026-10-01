@@ -6,3 +6,21 @@ build/
 my_build/
 .idea/
 .vscode/
+
+# Bachelor project generated files
+build/
+cmake-build-*/
+.DS_Store
+
+# Compiled/binary artifacts
+*.o
+*.a
+*.dylib
+*.so
+*.pch
+
+# Reconstruction outputs
+*.ply
+
+# Logs
+*.log
