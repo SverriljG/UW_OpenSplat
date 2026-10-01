@@ -281,6 +281,10 @@ We recently released OpenSplat, so there's lots of work to do.
 
  https://github.com/pierotofy/OpenSplat/issues?q=is%3Aopen+is%3Aissue+label%3Aenhancement
 
+## Underwater training (SeaThru / SeaSplat)
+
+Enable the post-rasterization medium with `--underwater` and related flags (`--medium-from-iter`, `--medium-detach-depth`, etc.). For ablations on scenes such as `chain_uw`, SeaSplat’s edge-aware depth smoothness can be enabled with `--medium-smooth-depth <weight>` once the medium is active (default `0` preserves prior behavior). SeaSplat uses `depth_smooth_lambda = 2.0` in `arguments/__init__.py`; that is a reasonable starting weight.
+
 ## Contributing
 
 We welcome contributions! Pull requests are welcome.
