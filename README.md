@@ -281,6 +281,35 @@ We recently released OpenSplat, so there's lots of work to do.
 
  https://github.com/pierotofy/OpenSplat/issues?q=is%3Aopen+is%3Aissue+label%3Aenhancement
 
+## Underwater training (SeaThru / SeaSplat)
+
+Enable the post-rasterization medium with `--underwater` and related flags (`--medium-from-iter`, `--medium-detach-depth`, etc.). For ablations on scenes such as `chain_uw`, SeaSplat’s edge-aware depth smoothness can be enabled with `--medium-smooth-depth <weight>` once the medium is active (default `0` preserves prior behavior).
+
+**SmoothDepth numerics:** the TV term always min-max normalizes rendered depth to ~`[0,1]` with detached stats (SeaSplat’s `norm_depth_max=True`), independently of `--medium-normalize-depth` (which still controls the medium image-formation path only). Applying TV on raw metric depth made `|∇Z|` O(meters), so even small weights could dominate the photometric loss and drive NaN on Metal/MPS. Edge weights use `exp(-|∇I|)` (paper eq. 8). Low-α / non-finite depth pairs are masked out of the mean.
+
+Recommended starting weight is **`2.0`** (SeaSplat `depth_smooth_lambda`). If loss still climbs aggressively right after the medium turns on, try `1.0` or `0.5` before concluding the term is at fault.
+
+### Rebuild (after pulling this change)
+
+```bash
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+On macOS / Metal the usual LibTorch + Metal flags from the main build docs still apply; no extra CMake options are required for SmoothDepth.
+
+### chain_uw SmoothDepth ablation (MacBook Air M1 example)
+
+```bash
+./build/opensplat ../chain_input -n 9000 -d 4 \
+  --underwater --medium-from-iter 3000 \
+  --medium-smooth-depth 2.0 --medium-detach-depth \
+  --max-gaussians 300000 --no-gpu-cache \
+  --val --val-image frame_000130.png -o ../out_smooth.ply
+```
+
+**What to watch:** printed step loss must stay finite for the full 9000 iters (especially after iter 3000). Startup should print `smoothDepthLossSanityCheck: ok`. Medium params in the end-of-run summary should stay O(1) via softplus/sigmoid (not exploding). Validation PSNR should remain in a plausible band rather than collapsing. If loss prints `*** non-finite loss ***`, stop and report the step number.
+
 ## Contributing
 
 We welcome contributions! Pull requests are welcome.
