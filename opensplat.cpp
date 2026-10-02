@@ -1,4 +1,5 @@
 #include <filesystem>
+#include <cmath>
 #include <nlohmann/json.hpp>
 #include "opensplat.hpp"
 #include "input_data.hpp"
@@ -37,7 +38,7 @@ int main(int argc, char *argv[]){
         ("medium-residual", "Include the SeaThru residual backscatter term", cxxopts::value<bool>()->default_value("false"))
         ("medium-normalize-depth", "Min-max normalize depth per image before the medium model (reproduces SeaSplat, but discards metric range)", cxxopts::value<bool>()->default_value("false"))
         ("medium-detach-depth", "Do not backpropagate the medium loss into gaussian positions through depth (cheaper, and an ablation of the geometry claim)", cxxopts::value<bool>()->default_value("false"))
-        ("medium-smooth-depth", "Weight for SeaSplat-style edge-aware depth smoothness (TV) once the medium is active; 0 disables (default). SeaSplat uses lambda=2.0 — try e.g. 2.0 for chain_uw ablations", cxxopts::value<float>()->default_value("0.0"))
+        ("medium-smooth-depth", "Weight for SeaSplat-style edge-aware depth smoothness (TV) once the medium is active; 0 disables (default). Depth is min-max normalized for this term only (SeaSplat norm_depth_max). SeaSplat uses lambda=2.0", cxxopts::value<float>()->default_value("0.0"))
         ("medium-grayworld", "Weight of a gray-world prior on the recovered color, which discourages the medium from explaining the whole image", cxxopts::value<float>()->default_value("0.0"))
         ("no-medium-bg-depth", "Do not push uncovered pixels to the far plane before the medium model. Those pixels are open water rather than zero distance, so by default backscatter is allowed to fill them", cxxopts::value<bool>()->default_value("false"))
         ("center", "Center the model at the origin")
@@ -233,15 +234,20 @@ int main(int argc, char *argv[]){
             std::cout << "Underwater image formation model enabled from step " << mediumFromIter << std::endl;
             if (mediumSmoothDepthWeight > 0.0f){
                 std::cout << "Edge-aware depth smoothness (SeaSplat TV) weight " << mediumSmoothDepthWeight
-                          << " (active from the same step as the medium)" << std::endl;
+                          << " (active from the same step as the medium; depth is min-max"
+                          << " normalized for the TV term only)" << std::endl;
+                if (!smoothDepthLossSanityCheck()){
+                    std::cerr << "Warning: smoothDepthLossSanityCheck failed; "
+                              << "continuing but SmoothDepth may be unreliable" << std::endl;
+                }
             }
         }else if (mediumSmoothDepthWeight > 0.0f){
             std::cerr << "Warning: --medium-smooth-depth is ignored without --underwater" << std::endl;
         }
 
         // Depth preprocessing shared by the medium and smooth-depth loss. detachForMedium
-        // honors --medium-detach-depth for the image-formation path only; smooth-depth
-        // always calls with detachForMedium=false so geometry can still be regularized.
+        // honors --medium-detach-depth for the image-formation path only; when SmoothDepth
+        // is on we render once with grads and detach a copy for the medium if requested.
         auto prepareMediumDepth = [&model, mediumDetachDepth, mediumNormalizeDepth, mediumBgDepth](
                 Camera &c, int atStep, bool detachForMedium){
             torch::Tensor depth;
@@ -251,6 +257,11 @@ int main(int argc, char *argv[]){
             }else{
                 depth = model.renderDepth(c, atStep);
             }
+
+            // α-normalized depth can yield Inf/NaN on near-empty pixels; keep the medium
+            // and SmoothDepth paths on finite, non-negative values.
+            depth = torch::nan_to_num(depth, /*nan=*/0.0f, /*posinf=*/0.0f, /*neginf=*/0.0f);
+            depth = torch::clamp_min(depth, 0.0f);
 
             // A pixel no gaussian covers is open water, not zero distance. Pushing it to
             // the far plane lets backscatter saturate to B_inf and supply the water column
@@ -266,6 +277,15 @@ int main(int argc, char *argv[]){
                 depth = (depth - dMin) / torch::clamp_min(dMax - dMin, 1e-6f);
             }
             return depth;
+        };
+
+        // SeaSplat applies SmoothDepth after norm_depth_max (min-max to [0,1]). Metric
+        // depth makes |∇Z| O(meters) so λ≈2.0 swamps the photometric loss and can NaN.
+        auto depthForSmoothDepthLoss = [](const torch::Tensor &depth){
+            torch::Tensor finite = torch::nan_to_num(depth, /*nan=*/0.0f, /*posinf=*/0.0f, /*neginf=*/0.0f);
+            torch::Tensor dMin = finite.min().detach();
+            torch::Tensor dMax = finite.max().detach();
+            return (finite - dMin) / torch::clamp_min(dMax - dMin, 1e-3f);
         };
 
         auto mediumDepth = [&prepareMediumDepth](Camera &c, int atStep){
@@ -290,24 +310,45 @@ int main(int argc, char *argv[]){
             // With the medium enabled the gaussians render medium-free color, which is
             // pushed through attenuation and backscatter before being compared to the photo
             const bool mediumActive = medium && static_cast<int>(step) > mediumFromIter;
-            torch::Tensor rendered = mediumActive ? medium->compose(rgb, mediumDepth(cam, step))
-                                                  : rgb;
+            const bool useSmoothDepth = mediumActive && mediumSmoothDepthWeight > 0.0f;
+
+            // One depth render when SmoothDepth is on: grads for TV, optional detach for medium.
+            torch::Tensor sharedDepth;
+            torch::Tensor sharedDepthAlpha;
+            torch::Tensor rendered;
+            if (useSmoothDepth){
+                sharedDepth = prepareMediumDepth(cam, step, false);
+                sharedDepthAlpha = model.lastDepthAlpha;
+                torch::Tensor depthForMedium = mediumDetachDepth ? sharedDepth.detach() : sharedDepth;
+                rendered = medium->compose(rgb, depthForMedium);
+            }else if (mediumActive){
+                rendered = medium->compose(rgb, mediumDepth(cam, step));
+            }else{
+                rendered = rgb;
+            }
 
             torch::Tensor mainLoss = model.mainLoss(rendered, gt, mask, ssimWeight);
             if (mediumActive && mediumGrayWorld > 0.0f){
                 torch::Tensor channelMean = rgb.mean(std::vector<int64_t>{0, 1});
                 mainLoss = mainLoss + mediumGrayWorld * (channelMean - channelMean.mean()).pow(2).sum();
             }
-            if (mediumActive && mediumSmoothDepthWeight > 0.0f){
-                torch::Tensor depthForSmooth = prepareMediumDepth(cam, step, false);
-                mainLoss = mainLoss + mediumSmoothDepthWeight * smoothDepthLoss(gt, depthForSmooth);
+            if (useSmoothDepth){
+                torch::Tensor depthNorm = depthForSmoothDepthLoss(sharedDepth);
+                mainLoss = mainLoss + mediumSmoothDepthWeight *
+                           smoothDepthLoss(gt, depthNorm, sharedDepthAlpha);
             }
             mainLoss.backward();
             if (mediumActive) medium->step();
 
             if (step % displayStep == 0) {
                 const float percentage = static_cast<float>(step) / numIters;
-                std::cout << "Step " << step << ": " << mainLoss.item<float>() << " [" << floor(percentage * 100) << "%]" <<  std::endl;
+                const float lossVal = mainLoss.item<float>();
+                std::cout << "Step " << step << ": " << lossVal
+                          << " [" << floor(percentage * 100) << "%]";
+                if (!std::isfinite(lossVal)){
+                    std::cout << "  *** non-finite loss ***";
+                }
+                std::cout << std::endl;
             }
 
             model.afterTrain(step);
