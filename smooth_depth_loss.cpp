@@ -6,14 +6,27 @@
 
 namespace {
 
+using torch::indexing::Slice;
+
+// LibTorch Tensor::diff(n=1, dim=-1): the first positional arg is n, NOT dim.
+// Always pass both explicitly for spatial gradients on [H,W,*] tensors.
+torch::Tensor spatialDiff(const torch::Tensor &t, int64_t dim){
+    return t.diff(/*n=*/1, /*dim=*/dim);
+}
+
 torch::Tensor neighborBothValid(const torch::Tensor &valid, int64_t dim){
     // valid: [H,W] bool. For diffs along dim, keep pairs where both sides are valid.
-    return valid.slice(dim, 0, valid.size(dim) - 1) &
-           valid.slice(dim, 1, valid.size(dim));
+    const auto len = valid.size(dim) - 1;
+    return valid.narrow(dim, 0, len) & valid.narrow(dim, 1, len);
 }
 
 torch::Tensor maskedAbsMean(const torch::Tensor &values, const torch::Tensor &pairMask){
     // values: [H,W-1,1] or [H-1,W,1]; pairMask: matching [H,W-1] or [H-1,W]
+    TORCH_CHECK(values.dim() == 3 && pairMask.dim() == 2,
+                "maskedAbsMean expects values [*,*,1] and pairMask [*,*]");
+    TORCH_CHECK(values.size(0) == pairMask.size(0) && values.size(1) == pairMask.size(1),
+                "maskedAbsMean shape mismatch: values ", values.sizes(),
+                " vs pairMask ", pairMask.sizes());
     torch::Tensor m = pairMask.to(values.dtype()).unsqueeze(-1);
     torch::Tensor denom = m.sum().clamp_min(1.0f);
     return (values.abs() * m).sum() / denom;
@@ -29,12 +42,14 @@ torch::Tensor smoothDepthLoss(const torch::Tensor &rgb,
     torch::Tensor z = torch::nan_to_num(depth, /*nan=*/0.0f, /*posinf=*/0.0f, /*neginf=*/0.0f);
     z = torch::clamp_min(z, 0.0f).unsqueeze(-1); // [H,W,1]
 
-    torch::Tensor depthDx = z.diff(1);
-    torch::Tensor depthDy = z.diff(0);
+    // Spatial diffs: dim 1 = x (width), dim 0 = y (height). Do not call .diff(1) —
+    // that sets n=1 with dim=-1 and diffs the trailing channel axis instead.
+    torch::Tensor depthDx = spatialDiff(z, /*dim=*/1); // [H,W-1,1]
+    torch::Tensor depthDy = spatialDiff(z, /*dim=*/0); // [H-1,W,1]
 
     // Paper eq. 8 / edge-aware TV: weight by exp(-|∇I|), channel-mean of RGB diffs.
-    torch::Tensor rgbDx = rgb.diff(1).mean(-1, true).abs();
-    torch::Tensor rgbDy = rgb.diff(0).mean(-1, true).abs();
+    torch::Tensor rgbDx = spatialDiff(rgb, /*dim=*/1).mean(-1, true).abs(); // [H,W-1,1]
+    torch::Tensor rgbDy = spatialDiff(rgb, /*dim=*/0).mean(-1, true).abs(); // [H-1,W,1]
 
     // Clamp image grads so exp is well-behaved even if GT is outside [0,1].
     rgbDx = torch::clamp(rgbDx, 0.0f, 20.0f);
@@ -62,11 +77,20 @@ bool smoothDepthLossSanityCheck(){
     // Smooth ramp depth in [0,1] with a mild RGB edge — loss should be finite and small.
     const int64_t H = 32, W = 32;
     torch::Tensor rgb = torch::zeros({H, W, 3}, opts);
-    rgb.index_put_({torch::indexing::Slice(), torch::indexing::Slice(W / 2, W), torch::indexing::Slice()}, 1.0f);
+    rgb.index_put_({Slice(), Slice(W / 2, W), Slice()}, 1.0f);
 
     torch::Tensor ys = torch::linspace(0.0f, 1.0f, H, opts).unsqueeze(1).expand({H, W});
     torch::Tensor depth = ys.clone();
     torch::Tensor alpha = torch::ones({H, W}, opts);
+
+    // Shape contract: spatial dx/dy must be W-1 / H-1 (guards the LibTorch diff pitfall).
+    torch::Tensor zCheck = depth.unsqueeze(-1);
+    if (spatialDiff(zCheck, 1).size(1) != W - 1 || spatialDiff(zCheck, 0).size(0) != H - 1){
+        std::cerr << "smoothDepthLossSanityCheck: spatialDiff ranks wrong; "
+                  << "dx=" << spatialDiff(zCheck, 1).sizes()
+                  << " dy=" << spatialDiff(zCheck, 0).sizes() << std::endl;
+        return false;
+    }
 
     torch::Tensor loss = smoothDepthLoss(rgb, depth, alpha);
     if (!torch::isfinite(loss).item<bool>()){
@@ -98,7 +122,7 @@ bool smoothDepthLossSanityCheck(){
     torch::Tensor dirty = normed.clone();
     dirty.index_put_({0, 0}, std::numeric_limits<float>::quiet_NaN());
     torch::Tensor sparseAlpha = alpha.clone();
-    sparseAlpha.index_put_({torch::indexing::Slice(), torch::indexing::Slice(0, 2)}, 0.0f);
+    sparseAlpha.index_put_({Slice(), Slice(0, 2)}, 0.0f);
     torch::Tensor lossMasked = smoothDepthLoss(rgb, dirty, sparseAlpha);
     if (!torch::isfinite(lossMasked).item<bool>()){
         std::cerr << "smoothDepthLossSanityCheck: mask failed to keep loss finite" << std::endl;

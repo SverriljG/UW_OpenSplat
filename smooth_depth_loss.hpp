@@ -12,6 +12,9 @@
 // (0, 1]. Depth should be min-max normalized to ~[0,1] before this (SeaSplat
 // default norm_depth_max=True); metric depth makes λ≈2 dominate the loss.
 //
+// LibTorch note: Tensor::diff(n=1, dim=-1) — never call .diff(1) intending
+// "along dim 1"; that diffs the trailing axis and breaks [H,W,1] depth.
+//
 // rgb:   [H,W,3] ground-truth image (edge weights; no grad needed)
 // depth: [H,W]   rendered depth (gradients flow here)
 // alpha: optional [H,W] coverage; when defined, pairs involving low-alpha or
